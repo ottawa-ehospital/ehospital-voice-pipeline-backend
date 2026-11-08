@@ -1,0 +1,262 @@
+"""FastAPI backend for the Flutter voice demo. Run: uvicorn app:app --reload"""
+
+import os
+import asyncio
+from contextlib import asynccontextmanager, suppress
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from pydantic import BaseModel
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+from services import LANGUAGES, check_target, transcribe_audio, translate_text
+from live import live_router
+from security import APIProtectionMiddleware
+import whatsapp
+import voice_feedback
+import followup
+import scheduled_messages
+
+ALLOWED_EXTENSIONS = {".ogg", ".opus", ".mp3", ".wav", ".m4a", ".webm"}
+CLIENT_METADATA_MAX_LENGTH = 100
+try:
+    MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
+    if not 1 <= MAX_UPLOAD_MB <= 25:
+        raise ValueError
+except ValueError:
+    raise RuntimeError("MAX_UPLOAD_MB must be a whole number from 1 to 25.") from None
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1_000_000
+DEFAULT_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174,http://localhost:8000,http://127.0.0.1:8000,http://localhost:8003,http://127.0.0.1:8003"
+# Flutter's Chrome runner may choose a different local port when its requested
+# port is occupied. Keep this pattern loopback-only; configured production
+# origins remain an exact allowlist and no wildcard is used.
+LOCAL_DEV_ORIGIN_REGEX = r"^http://(?:localhost|127\.0\.0\.1)(?::\d+)?$"
+
+@asynccontextmanager
+async def lifespan(_app):
+    tasks = [asyncio.create_task(whatsapp.worker()),
+             asyncio.create_task(scheduled_messages.scheduler_worker())]
+    try:
+        yield
+    finally:
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                await task
+
+
+app = FastAPI(title="Voice Notes v3 — iOS & WhatsApp", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def log_whatsapp_webhook(request: Request, call_next):
+    if request.method != 'POST' or request.url.path != '/webhooks/whatsapp':
+        return await call_next(request)
+    # Never log the URL/query, headers, body, or exception details. GET
+    # verification includes a secret in its query and is deliberately excluded.
+    request.state.whatsapp_signature = 'not_checked'
+    whatsapp.logger.info('WhatsApp webhook POST reached.')
+    try:
+        response = await call_next(request)
+    except Exception:
+        whatsapp.logger.warning('WhatsApp webhook response: status=500 signature=%s.',
+                                request.state.whatsapp_signature)
+        raise
+    whatsapp.logger.info('WhatsApp webhook response: status=%d signature=%s.',
+                         response.status_code, request.state.whatsapp_signature)
+    return response
+
+
+app.add_middleware(APIProtectionMiddleware, upload_bytes=MAX_UPLOAD_BYTES)
+# CORS preflight is handled outside authentication. Ordinary OPTIONS requests
+# still require credentials, and preflight never executes an API operation.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[v.strip() for v in os.getenv("ALLOWED_ORIGINS", DEFAULT_ORIGINS).split(",")],
+    allow_origin_regex=LOCAL_DEV_ORIGIN_REGEX,
+    allow_methods=["GET", "POST"], allow_headers=["Content-Type", "Authorization"],
+)
+app.include_router(live_router)
+app.include_router(whatsapp.router)
+app.include_router(followup.router)
+app.include_router(scheduled_messages.router)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_error(_request: Request, exc: StarletteHTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"success": False, "error": str(exc.detail)})
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request: Request, exc: RequestValidationError):
+    if request.url.path.startswith('/api/whatsapp/schedules'):
+        errors = []
+        for item in exc.errors():
+            location = '.'.join(str(part) for part in item.get('loc', ()) if part != 'body')
+            errors.append({'field': location, 'message': item.get('msg', 'Invalid value.')})
+        return JSONResponse(status_code=400, content={'success': False,
+            'error': 'Check the scheduled message details.', 'details': errors})
+    return JSONResponse(status_code=400, content={"success": False, "error": "Check the audio file and target language."})
+
+
+@app.get("/api/config")
+async def config():
+    return {"max_upload_bytes": MAX_UPLOAD_BYTES, "allowed_extensions": sorted(ALLOWED_EXTENSIONS),
+            "languages": LANGUAGES, "live_sample_rate": 24000, "version": "3.3.0",
+            "whatsapp": whatsapp.settings(),
+            "save_to_database": voice_feedback.get_save_to_database()}
+
+
+class SaveSetting(BaseModel):
+    enabled: bool
+
+
+@app.post('/api/settings/save-to-database')
+async def update_save_setting(setting: SaveSetting):
+    return {'save_to_database': voice_feedback.set_save_to_database(setting.enabled)}
+
+
+@app.get('/health')
+async def health():
+    return {'status': 'ok', 'version': '3.3.0'}
+
+
+def client_metadata(value: str | None) -> str | None:
+    value = (value or '').strip()
+    if not value:
+        return None
+    if len(value) > CLIENT_METADATA_MAX_LENGTH:
+        raise HTTPException(400, "Client metadata is too long.")
+    return value
+
+
+@app.post("/api/transcribe")
+async def transcribe(file: UploadFile | None = File(default=None), target_language: str = Form(""),
+                     client_platform: str = Form(""), client_os_version: str = Form(""),
+                     client_app_version: str = Form(""), client_device_model: str = Form(""),
+                     client_is_simulator: str = Form("")):
+    """Transcribe an upload, persisting it only when the global setting is enabled."""
+    try:
+        client_platform = client_metadata(client_platform)
+        client_os_version = client_metadata(client_os_version)
+        client_app_version = client_metadata(client_app_version)
+        client_device_model = client_metadata(client_device_model)
+        if client_is_simulator not in {"", "true", "false"}:
+            raise HTTPException(400, "Invalid simulator metadata.")
+        is_simulator = client_is_simulator == "true" if client_is_simulator else None
+        if target_language:
+            check_target(target_language)
+        if file is None or not file.filename:
+            raise HTTPException(400, "Please select an audio file.")
+        filename = Path(file.filename.replace("\\", "/")).name
+        extension = Path(filename).suffix.lower()
+        if extension not in ALLOWED_EXTENSIONS:
+            raise HTTPException(400, "Choose an .ogg, .opus, .mp3, .wav, .m4a, or .webm audio file.")
+        if file.size is not None and file.size > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, f"File too large. Maximum size: {MAX_UPLOAD_MB} MB.")
+        with TemporaryDirectory(prefix="voice-upload-") as directory:
+            path = Path(directory) / f"audio{extension}"
+            size = 0
+            with path.open("wb") as output:
+                while chunk := await file.read(64 * 1024):
+                    size += len(chunk)
+                    if size > MAX_UPLOAD_BYTES:
+                        raise HTTPException(413, f"File too large. Maximum size: {MAX_UPLOAD_MB} MB.")
+                    output.write(chunk)
+            if not size:
+                raise HTTPException(400, "The audio file is empty.")
+            mime_type = {
+                '.ogg': 'audio/ogg', '.opus': 'audio/opus', '.mp3': 'audio/mpeg',
+                '.wav': 'audio/wav', '.m4a': 'audio/mp4', '.webm': 'audio/webm',
+            }[extension]
+            save_enabled = voice_feedback.get_save_to_database()
+            record = voice_feedback.store_audio(
+                path, extension=extension, mime_type=mime_type,
+                client_platform=client_platform, client_os_version=client_os_version,
+                client_app_version=client_app_version, client_device_model=client_device_model,
+                client_is_simulator=is_simulator) if save_enabled else None
+            try:
+                transcript = await transcribe_audio(
+                    str(voice_feedback.audio_directory() / record['file_name']) if record else str(path))
+            except HTTPException as exc:
+                if record:
+                    voice_feedback.mark_failed(record['audio_path'],
+                        'Transcription failed. Check the audio file or provider settings and retry.')
+                raise exc
+            except Exception:
+                if record:
+                    voice_feedback.mark_failed(record['audio_path'],
+                        'Transcription failed. Check backend settings and retry.')
+                raise HTTPException(500, "Transcription failed. Please retry.") from None
+            if record:
+                voice_feedback.mark_completed(record['audio_path'], transcript)
+        result = {"success": True, "filename": filename, "transcript": transcript,
+                  "translation": "", "target_language": target_language,
+                  "saved": save_enabled, "source": 'upload'}
+        if target_language:
+            try:
+                result["translation"] = await translate_text(transcript, target_language)
+            except HTTPException as exc:
+                # A translation outage should not discard a successful transcript.
+                result["translation_error"] = str(exc.detail)
+        return result
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(500, "Processing failed. Please try again.") from None
+    finally:
+        if file is not None:
+            await file.close()
+
+
+@app.post("/api/assistant/transcribe")
+async def transcribe_assistant_audio(file: UploadFile | None = File(default=None)):
+    """Transcribe chat audio in an ephemeral directory, independent of retention settings."""
+    try:
+        if file is None or not file.filename:
+            raise HTTPException(400, "Please record an audio message.")
+        extension = Path(file.filename.replace("\\", "/")).suffix.lower()
+        if extension not in ALLOWED_EXTENSIONS:
+            raise HTTPException(400, "The recorded audio format is not supported.")
+        if file.size is not None and file.size > min(MAX_UPLOAD_BYTES, 10_000_000):
+            raise HTTPException(413, "The recording is too large.")
+        with TemporaryDirectory(prefix="assistant-transcription-") as directory:
+            path = Path(directory) / f"recording{extension}"
+            size = 0
+            with path.open("wb") as output:
+                while chunk := await file.read(64 * 1024):
+                    size += len(chunk)
+                    if size > min(MAX_UPLOAD_BYTES, 10_000_000):
+                        raise HTTPException(413, "The recording is too large.")
+                    output.write(chunk)
+            if not size:
+                raise HTTPException(400, "The recording is empty.")
+            transcript = await transcribe_audio(str(path))
+        return {"success": True, "transcript": transcript}
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(500, "Transcription failed. Please try again.") from None
+    finally:
+        if file is not None:
+            await file.close()
+
+
+# Serve the compiled Flutter app after `flutter build web`. API routes come first.
+WEB_BUILD = BASE_DIR.parent / "frontend" / "build" / "web"
+if WEB_BUILD.is_dir():
+    app.mount("/", StaticFiles(directory=WEB_BUILD, html=True), name="flutter")
+else:
+    @app.get("/")
+    async def index():
+        return {"message": "Backend ready. Run Flutter on http://localhost:5173. See README.md.", "docs": "/docs"}
