@@ -412,7 +412,7 @@ async def followups_send(action: SendAction):
         raise HTTPException(503, 'Complete the WhatsApp Meta configuration before sending.')
     template = os.getenv('WHATSAPP_FOLLOWUP_TEMPLATE_NAME','').strip()
     if not re.fullmatch(r'[a-z0-9_]{1,512}', template):
-        raise HTTPException(503, 'Configure an approved WhatsApp follow-up template in backend/.env.')
+        raise HTTPException(503, 'Configure an approved WhatsApp follow-up template in .env.')
     with _database() as db:
         draft = db.execute('''SELECT t.*,c.name,c.language FROM wa_followup_tasks t
             JOIN wa_contacts c ON c.id=t.contact_id WHERE t.id=?''', (action.task_id,)).fetchone()

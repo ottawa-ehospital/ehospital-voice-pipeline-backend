@@ -233,7 +233,7 @@ def check_media_response(response: httpx.Response, *, stage: str) -> None:
     if response.status_code == 401 or code == 190:
         raise HTTPException(401,
             'Meta rejected WHATSAPP_ACCESS_TOKEN. It may be expired or invalid. '
-            'Update it in backend/.env, restart FastAPI, then tap Retry.')
+            'Update it in .env, restart FastAPI, then tap Retry.')
     if response.status_code == 403:
         raise HTTPException(403,
             'Meta denied access to the WhatsApp audio. Check WHATSAPP_ACCESS_TOKEN '

@@ -53,7 +53,7 @@ async def verify_template(language: str, template_name: str | None = None,
     if not name:
         raise HTTPException(503, 'Configure a template name or choose one from the approved Meta templates.')
     if not re.fullmatch(r'[a-z0-9_]{1,512}', name):
-        raise HTTPException(503, 'Configure a valid WHATSAPP_FOLLOWUP_TEMPLATE_NAME in backend/.env.')
+        raise HTTPException(503, 'Configure a valid WHATSAPP_FOLLOWUP_TEMPLATE_NAME in .env.')
     if not re.fullmatch(r'[a-z]{2,3}(?:_[A-Z]{2})?', language):
         raise HTTPException(400, 'Choose a valid WhatsApp template language code.')
     base = f"https://graph.facebook.com/{settings['WHATSAPP_GRAPH_VERSION']}"

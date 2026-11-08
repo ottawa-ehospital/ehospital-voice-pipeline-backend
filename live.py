@@ -27,7 +27,7 @@ def upstream_error(event: dict) -> HTTPException:
     if code in {"insufficient_quota", "rate_limit_exceeded"}:
         return HTTPException(429, "Live translation reached an API usage limit. Check billing or retry later.")
     if code in {"invalid_api_key", "authentication_error"}:
-        return HTTPException(503, "OpenAI rejected OPENAI_API_KEY. Replace it in backend/.env and restart FastAPI.")
+        return HTTPException(503, "OpenAI rejected OPENAI_API_KEY. Replace it in .env and restart FastAPI.")
     if code in {"model_not_found", "permission_denied"}:
         return HTTPException(503, "The OpenAI live translation model is unavailable for this project. Check model access and permissions.")
     return HTTPException(502, "Live translation is unavailable. Check API key access, target language and REALTIME_TRANSLATION_MODEL on the backend.")
@@ -39,7 +39,7 @@ def closed_error(exc: ConnectionClosed) -> str:
     reason = getattr(received, "reason", "") or ""
     details = f"{reason} {received or ''} {exc}"
     if "invalid_api_key" in details or "authentication" in details:
-        return "OpenAI rejected OPENAI_API_KEY. Replace it in backend/.env and restart FastAPI."
+        return "OpenAI rejected OPENAI_API_KEY. Replace it in .env and restart FastAPI."
     if "permission" in details or "model_not_found" in details:
         return "The OpenAI live translation model is unavailable for this project. Check model access and permissions."
     return "Could not connect to live translation. Check the backend connection, API billing and model access."

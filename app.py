@@ -253,7 +253,7 @@ async def transcribe_assistant_audio(file: UploadFile | None = File(default=None
 
 
 # Serve the compiled Flutter app after `flutter build web`. API routes come first.
-WEB_BUILD = BASE_DIR.parent / "frontend" / "build" / "web"
+WEB_BUILD = BASE_DIR / "frontend" / "build" / "web"
 if WEB_BUILD.is_dir():
     app.mount("/", StaticFiles(directory=WEB_BUILD, html=True), name="flutter")
 else:

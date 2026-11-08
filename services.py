@@ -37,7 +37,7 @@ async def provider():
     except (BadRequestError, UnprocessableEntityError):
         raise HTTPException(400, "The service could not process this audio or request. Check the recording and model configuration.") from None
     except AuthenticationError:
-        raise HTTPException(503, "OpenAI rejected OPENAI_API_KEY. Replace it in backend/.env and restart FastAPI.") from None
+        raise HTTPException(503, "OpenAI rejected OPENAI_API_KEY. Replace it in .env and restart FastAPI.") from None
     except PermissionDeniedError:
         raise HTTPException(503, "OpenAI denied access to this model or project. Check model permissions.") from None
     except RateLimitError:
